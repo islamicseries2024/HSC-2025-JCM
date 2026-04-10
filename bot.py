@@ -1,232 +1,148 @@
+import os
+import requests
+import threading
+from bs4 import BeautifulSoup
 from flask import Flask
-from threading import Thread
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-# ================= KEEP ALIVE =================
-app_web = Flask('')
+# ---------- CONFIGURATION ----------
+TOKEN = "8207041062:AAHWN5Bf2Yih5kld7n_8jAwAfonAzffRd2s"
 
-@app_web.route('/')
-def home():
-    return "Bot is running!"
+# ---------- KEEP ALIVE ----------
+server = Flask(__name__)
+@server.route('/')
+def home(): return "Bot is running 24/7!"
 
-def run():
-    app_web.run(host='0.0.0.0', port=10000)
+def run_server():
+    port = int(os.environ.get("PORT", 8080))
+    server.run(host='0.0.0.0', port=port)
 
 def keep_alive():
-    t = Thread(target=run)
-    t.start()
+    threading.Thread(target=run_server).start()
 
-# ================= ORIGINAL CODE =================
-import requests
-import time
-import csv
-import os
-from bs4 import BeautifulSoup
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+# ---------- SCRAPING FUNCTIONS ----------
 
-TOKEN = "8643223258:AAF2qByjhoWCUhgWqv1_zWkoaHMx6anPwXg"
-FILE_NAME = "data.csv"
-
-last_range = {}
-
-def init_file():
-    if not os.path.exists(FILE_NAME):
-        with open(FILE_NAME, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(["Name","Roll","Board","Mobile","Date","TranID"])
-
-def is_duplicate(tran_id):
-    if not os.path.exists(FILE_NAME):
-        return False
-    with open(FILE_NAME, "r", encoding="utf-8") as f:
-        return any(tran_id in row for row in f)
-
-def save_data(name, roll, board, mobile, date, tran_id):
-    if is_duplicate(tran_id):
-        return
-    with open(FILE_NAME, "a", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow([name, roll, board, mobile, date, tran_id])
-
-def get_tran_ids(roll):
-    url = f"https://billpay.sonalibank.com.bd/BoardRescrutiny/Home/Search?searchStr={roll}"
-    res = requests.get(url)
-    soup = BeautifulSoup(res.text, "html.parser")
-
-    ids = []
+def get_board_result(url, roll, board_name):
     try:
-        rows = soup.find("table").find_all("tr")[1:]
-        for r in rows:
-            ids.append(r.find_all("td")[1].text.strip())
-    except:
-        pass
+        session = requests.Session()
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Referer": url
+        }
+        
+        # Mymensingh needs cookie initialization
+        if board_name == "Mymensingh":
+            session.get("https://www.mymensingheducationboard.gov.bd/resultmbh25/", headers=headers)
+        
+        payload = {"roll": roll, "regno": ""}
+        if board_name == "Chattogram":
+            payload = {"roll": roll, "button2": "Submit"}
+            headers["Referer"] = "https://hscresult.bise-ctg.gov.bd/h_x_y_ctg25/individual/index.php"
 
-    return ids
+        res = session.post(url, data=payload, headers=headers, timeout=15)
+        soup = BeautifulSoup(res.text, "html.parser")
 
-def get_full_data(tran_id):
-    url = f"https://billpay.sonalibank.com.bd/BoardRescrutiny/Home/Voucher/{tran_id}"
-    res = requests.get(url)
-    soup = BeautifulSoup(res.text, "html.parser")
+        # Data collection dictionary
+        extracted_data = {}
+        for row in soup.find_all("tr"):
+            cols = row.find_all("td")
+            if len(cols) == 4:
+                extracted_data[cols[0].get_text(strip=True)] = cols[1].get_text(strip=True)
+                extracted_data[cols[2].get_text(strip=True)] = cols[3].get_text(strip=True)
+            elif len(cols) == 2:
+                extracted_data[cols[0].get_text(strip=True)] = cols[1].get_text(strip=True)
 
-    try:
-        lines = [l.strip() for l in soup.get_text("\n").split("\n") if l.strip()]
+        name = extracted_data.get("Name")
+        if not name: return None
 
-        def find(label):
-            for i in range(len(lines)):
-                if label in lines[i]:
-                    return lines[i+1]
-            return "Not found"
+        # সাবজেক্ট লিস্ট প্রসেসিং
+        subjects_list = []
+        for row in soup.find_all("tr"):
+            cols = row.find_all("td")
+            if len(cols) == 2:
+                c1, c2 = cols[0].get_text(strip=True), cols[1].get_text(strip=True)
+                # ফিল্টার আউট মেনু আইটেমস
+                if c1 and c2 and c1 not in ["Name", "Father's Name", "Mother's Name", "Result", "Institute", "Roll No", "GPA", "Group", "Reg. NO", "Board", "Session", "Type", "Subject", "Obtain Marks"]:
+                    subjects_list.append(f"{c1} → {c2}")
 
-        name = find("Name")
-        roll = find("Roll")
-        board = find("Board")
-        mobile = find("Mobile")
-        date = find("Date")
+        return {
+            "name": name,
+            "father": extracted_data.get("Father's Name", "N/A"),
+            "mother": extracted_data.get("Mother's Name", "N/A"),
+            "reg": extracted_data.get("Reg. NO") or extracted_data.get("Registration No") or "N/A",
+            "group": extracted_data.get("Group", "N/A"),
+            "result": extracted_data.get("Result", "N/A"),
+            "gpa": extracted_data.get("GPA", ""),
+            "inst": extracted_data.get("Institute", "N/A"),
+            "board": board_name.upper(),
+            "subjects": "\n".join(subjects_list) if subjects_list else "Details on website"
+        }
+    except: return None
 
-        save_data(name, roll, board, mobile, date, tran_id)
-
-        text = f"""<pre>
-Name   : {name}
-Roll   : {roll}
-Board  : {board}
-Mobile : {mobile}
-Date   : {date}
-ID     : {tran_id}
-</pre>"""
-
-        return text, mobile
-    except:
-        return None, None
-
-def format_number_bd(mobile):
-    n = mobile.replace("+","").replace(" ","")
-    if n.startswith("01"):
-        return "880"+n[1:]
-    if n.startswith("880"):
-        return n
-    return None
-
-def get_contact_buttons(mobile):
-    n = format_number_bd(mobile)
-    if not n:
-        return None
-
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("📱 WhatsApp", url=f"https://wa.me/{n}"),
-        InlineKeyboardButton("✈️ Telegram", url=f"https://t.me/+{n}")
-    ]])
-
-def next_button():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➡️ Next 50", callback_data="next50")]
-    ])
-
-def get_keyboard():
-    return ReplyKeyboardMarkup(
-        [["🚀 Start"],["📂 Search Database"],["📥 Download Data"]],
-        resize_keyboard=True
-    )
+# ---------- BOT LOGIC ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Welcome!", reply_markup=get_keyboard())
+    keyboard = [['Mymensingh', 'Jessore'], ['Chattogram']]
+    await update.message.reply_text(
+        "👋 স্বাগতম! কোন বোর্ডের রেজাল্ট দেখতে চান?",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    )
 
-async def run_range(message, context, start, end):
-    status = await message.reply_text("⏳ Processing...")
-    count = 0
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user_data = context.user_data
 
-    for roll in range(start, end+1):
-        await status.edit_text(f"⏳ Processing...\n🔢 Roll: {roll}\n📊 Found: {count}")
-
-        for tid in get_tran_ids(roll):
-            data, mobile = get_full_data(tid)
-
-            if data:
-                count += 1
-                await message.reply_text(
-                    f"📄 Result {count}:\n{data}",
-                    parse_mode="HTML",
-                    reply_markup=get_contact_buttons(mobile)
-                )
-
-        time.sleep(2)
-
-    await status.edit_text(f"✅ Done!\n📊 Total: {count}")
-    await message.reply_text("👉 Next 50?", reply_markup=next_button())
-
-async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    user_id = update.message.from_user.id
-
-    if text == "🚀 Start":
-        await update.message.reply_text("✅ Ready!", reply_markup=get_keyboard())
-        return
-
-    if text == "📂 Search Database":
-        await update.message.reply_text("👉 Roll বা Range দাও (max 50)")
-        return
-
-    if text == "📥 Download Data":
-        if os.path.exists(FILE_NAME):
-            await update.message.reply_document(open(FILE_NAME,"rb"))
-        else:
-            await update.message.reply_text("❌ No data")
+    if text in ['Mymensingh', 'Jessore', 'Chattogram']:
+        user_data['board'] = text
+        await update.message.reply_text(f"✅ আপনি {text} সিলেক্ট করেছেন। এবার Roll দিন:", reply_markup=ReplyKeyboardRemove())
         return
 
     if text.isdigit():
-        await update.message.reply_text("⏳ Searching...")
-        for i, tid in enumerate(get_tran_ids(int(text)),1):
-            data, mobile = get_full_data(tid)
-            if data:
-                await update.message.reply_text(
-                    f"📄 Result {i}:\n{data}",
-                    parse_mode="HTML",
-                    reply_markup=get_contact_buttons(mobile)
-                )
-        return
-
-    if "-" in text:
-        try:
-            start_r, end_r = map(int, text.split("-"))
-        except:
-            await update.message.reply_text("❌ Wrong format")
+        board = user_data.get('board')
+        if not board:
+            await update.message.reply_text("⚠️ আগে বোর্ড সিলেক্ট করুন! /start চাপুন।")
             return
 
-        if (end_r-start_r+1) > 50:
-            await update.message.reply_text("❌ Max 50")
-            return
+        wait_msg = await update.message.reply_text(f"⏳ {board} বোর্ডের রেজাল্ট আনা হচ্ছে...")
+        
+        url_map = {
+            'Mymensingh': "https://www.mymensingheducationboard.gov.bd/resultmbh25/result.php",
+            'Jessore': "https://www.jessoreboard.gov.bd/resultjbh25/result.php",
+            'Chattogram': "https://hscresult.bise-ctg.gov.bd/h_x_y_ctg25/individual/result_mark_details.php"
+        }
+        
+        res = get_board_result(url_map[board], text, board)
 
-        last_range[user_id] = (start_r, end_r)
-        await run_range(update.message, context, start_r, end_r)
-        return
+        if not res:
+            await wait_msg.edit_text("❌ রেজাল্ট পাওয়া যায়নি! রোল নম্বরটি চেক করুন।")
+        else:
+            msg = (
+                f"🧑‍🎓 STUDENT INFORMATION\n━━━━━━━━━━━━━━\n\n"
+                f"👤 Name: {res['name']}\n"
+                f"👨 Father: {res['father']}\n"
+                f"👩 Mother: {res['mother']}\n\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"📘 HSC RESULT 2025\n"
+                f"━━━━━━━━━━━━━━\n\n"
+                f"🆔 Roll No: {text}\n"
+                f"📄 Registration No: {res['reg']}\n\n"
+                f"🏫 Board: {res['board']}\n"
+                f"📚 Group: {res['group']}\n\n"
+                f"📊 Result: {res['result']}\n"
+                f"{('⭐ GPA: ' + res['gpa']) if res['gpa'].strip() else ''}\n\n"
+                f"🏫 Institute: {res['inst']}\n\n"
+                f"📊 SUBJECTS\n━━━━━━━━━━━━━━\n{res['subjects']}"
+            )
+            await wait_msg.edit_text(msg)
+        
+        await update.message.reply_text("আবার দেখতে চাইলে বোর্ড সিলেক্ট করুন:", 
+            reply_markup=ReplyKeyboardMarkup([['Mymensingh', 'Jessore'], ['Chattogram']], resize_keyboard=True))
 
-    await update.message.reply_text("❌ Invalid input")
-
-async def handle_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-
-    if user_id not in last_range:
-        await query.message.reply_text("❌ আগে search করো")
-        return
-
-    start_r, end_r = last_range[user_id]
-    new_start = end_r + 1
-    new_end = end_r + 50
-
-    last_range[user_id] = (new_start, new_end)
-
-    await query.message.reply_text(f"🔄 Auto: {new_start}-{new_end}")
-    await run_range(query.message, context, new_start, new_end)
-
-# ================= RUN =================
-init_file()
-keep_alive()  # 🔥 THIS IS THE MAGIC
-
-app = ApplicationBuilder().token(TOKEN).build()
-
-app.add_handler(CommandHandler("start", start))
-app.add_handler(MessageHandler(filters.TEXT, handle))
-app.add_handler(CallbackQueryHandler(handle_next))
-
-print("🤖 BOT RUNNING 24/7...")
-app.run_polling()
+if __name__ == "__main__":
+    keep_alive()
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    print("🚀 Bot Fix Updated!")
+    app.run_polling()
